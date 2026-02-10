@@ -2,7 +2,7 @@
 """Minimal Android APK build system.
 
 Single-file build tool that produces debug APKs from a YAML config.
-Handles SDK setup, resource compilation, Java compilation, DEX conversion,
+Handles SDK setup, resource compilation, Java/Kotlin compilation, DEX conversion,
 packaging, alignment, and signing.
 
 Usage:
@@ -179,6 +179,10 @@ class Config:
 
         self.sdk_dir = self._resolve(".android-sdk")
 
+        kotlin = raw.get("kotlin", {})
+        self.kotlin_version = str(kotlin["version"]) if kotlin.get("version") else None
+        self.kotlin_dir = self._resolve(".kotlin") if self.kotlin_version else None
+
     def _resolve(self, path):
         if os.path.isabs(path):
             return path
@@ -195,6 +199,24 @@ class Config:
     @property
     def android_jar(self):
         return os.path.join(self.platform_dir, "android.jar")
+
+    @property
+    def kotlin_home(self):
+        if not self.kotlin_dir:
+            return None
+        return os.path.join(self.kotlin_dir, "kotlinc")
+
+    @property
+    def kotlinc_bin(self):
+        if not self.kotlin_home:
+            return None
+        return os.path.join(self.kotlin_home, "bin", "kotlinc")
+
+    @property
+    def kotlin_stdlib(self):
+        if not self.kotlin_home:
+            return None
+        return os.path.join(self.kotlin_home, "lib", "kotlin-stdlib.jar")
 
     def tool(self, name):
         """Return full path to a build-tools binary."""
@@ -336,6 +358,56 @@ class SDKManager:
         print("SDK packages installed successfully.")
 
 
+# ---------------------------------------------------------------------------
+# Kotlin Manager
+# ---------------------------------------------------------------------------
+
+class KotlinManager:
+    """Downloads and installs the Kotlin compiler."""
+
+    _URL_TEMPLATE = (
+        "https://github.com/JetBrains/kotlin/releases/download/"
+        "v{version}/kotlin-compiler-{version}.zip"
+    )
+
+    def __init__(self, config):
+        self.config = config
+        self.version = config.kotlin_version
+        self.kotlin_dir = config.kotlin_dir
+        self.kotlin_home = config.kotlin_home
+        self.kotlinc_bin = config.kotlinc_bin
+
+    def setup(self):
+        """Download and extract the Kotlin compiler if not already present."""
+        if self.kotlinc_bin and os.path.isfile(self.kotlinc_bin):
+            print("Kotlin compiler already present, skipping download.")
+            return
+
+        url = self._URL_TEMPLATE.format(version=self.version)
+        print(f"Downloading Kotlin compiler {self.version}...")
+
+        os.makedirs(self.kotlin_dir, exist_ok=True)
+        zip_path = os.path.join(self.kotlin_dir, "kotlin-compiler.zip")
+        _download_with_progress(url, zip_path)
+
+        print("Extracting Kotlin compiler...")
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(self.kotlin_dir)
+
+        os.remove(zip_path)
+
+        # Make binaries executable on Unix
+        if platform.system() != "Windows":
+            bin_dir = os.path.join(self.kotlin_home, "bin")
+            if os.path.isdir(bin_dir):
+                for f in os.listdir(bin_dir):
+                    fp = os.path.join(bin_dir, f)
+                    st = os.stat(fp)
+                    os.chmod(fp, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+        print("Kotlin compiler installed.")
+
+
 def _download_with_progress(url, dest):
     """Download a URL to a local file with a simple progress indicator."""
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -424,7 +496,7 @@ class Builder:
 
         self._step1_compile_resources()
         self._step2_link_resources()
-        self._step3_compile_java()
+        self._step3_compile_sources()
         self._step4_dex()
         self._step5_inject_dex()
         self._step6_zipalign()
@@ -473,43 +545,78 @@ class Builder:
         cmd += flat_files
         _run(cmd, "aapt2 link")
 
-    # Step 3: javac
-    def _step3_compile_java(self):
-        print("[3/7] Compiling Java sources...")
-
-        # Collect all .java files from source dirs and generated R.java
-        java_files = []
+    # Step 3: compile sources (Java and/or Kotlin)
+    def _step3_compile_sources(self):
+        # Collect .java and .kt files from source dirs
+        user_java_files = []
+        kt_files = []
         for src_dir in self.cfg.sources:
             for root, _dirs, files in os.walk(src_dir):
                 for fname in files:
+                    fpath = os.path.join(root, fname)
                     if fname.endswith(".java"):
-                        java_files.append(os.path.join(root, fname))
+                        user_java_files.append(fpath)
+                    elif fname.endswith(".kt"):
+                        kt_files.append(fpath)
 
-        # Add generated R.java
+        # Collect generated R.java
+        gen_java_files = []
         for root, _dirs, files in os.walk(self.gen_dir):
             for fname in files:
                 if fname.endswith(".java"):
-                    java_files.append(os.path.join(root, fname))
+                    gen_java_files.append(os.path.join(root, fname))
 
-        if not java_files:
-            print("  No Java source files found!", file=sys.stderr)
-            sys.exit(1)
+        sep = ";" if platform.system() == "Windows" else ":"
+        classpath_parts = [self.cfg.android_jar] + self.cfg.libs
 
-        classpath = self.cfg.android_jar
-        if self.cfg.libs:
-            sep = ";" if platform.system() == "Windows" else ":"
-            classpath = sep.join([classpath] + self.cfg.libs)
+        if not kt_files:
+            # Java-only path (backward compatible)
+            print("[3/7] Compiling Java sources...")
+            all_java = user_java_files + gen_java_files
+            if not all_java:
+                print("  No source files found!", file=sys.stderr)
+                sys.exit(1)
 
-        cmd = [
-            "javac",
-            "-source", "1.8",
-            "-target", "1.8",
-            "-bootclasspath", self.cfg.android_jar,
-            "-classpath", classpath,
-            "-d", self.classes_dir,
-        ]
-        cmd += java_files
-        _run(cmd, "javac")
+            cmd = [
+                "javac",
+                "-source", "1.8",
+                "-target", "1.8",
+                "-bootclasspath", self.cfg.android_jar,
+                "-classpath", sep.join(classpath_parts),
+                "-d", self.classes_dir,
+            ]
+            cmd += all_java
+            _run(cmd, "javac")
+        else:
+            # Kotlin (or mixed) path
+            print("[3/7] Compiling Kotlin sources...")
+
+            # 3a: Compile generated R.java with javac so kotlinc can reference R
+            if gen_java_files:
+                print("  [3a] Compiling R.java...")
+                cmd = [
+                    "javac",
+                    "-source", "1.8",
+                    "-target", "1.8",
+                    "-bootclasspath", self.cfg.android_jar,
+                    "-classpath", sep.join(classpath_parts),
+                    "-d", self.classes_dir,
+                ]
+                cmd += gen_java_files
+                _run(cmd, "javac (R.java)")
+
+            # 3b: Compile .kt (and user .java) with kotlinc
+            print("  [3b] Compiling with kotlinc...")
+            kt_classpath_parts = classpath_parts + [self.classes_dir]
+            cmd = [
+                self.cfg.kotlinc_bin,
+                "-classpath", sep.join(kt_classpath_parts),
+                "-d", self.classes_dir,
+                "-jvm-target", "1.8",
+                "-no-stdlib",
+            ]
+            cmd += kt_files + user_java_files
+            _run(cmd, "kotlinc")
 
     # Step 4: d8 (DEX)
     def _step4_dex(self):
@@ -530,6 +637,11 @@ class Builder:
             "--lib", self.cfg.android_jar,
         ]
         cmd += class_files
+
+        # Include kotlin-stdlib.jar so stdlib classes are DEXed into the APK
+        if self.cfg.kotlin_version and self.cfg.kotlin_stdlib:
+            cmd.append(self.cfg.kotlin_stdlib)
+
         _run(cmd, "d8")
 
     # Step 5: Inject classes.dex into APK via Python zipfile
@@ -612,10 +724,14 @@ def _run(cmd, label="command"):
 # ---------------------------------------------------------------------------
 
 def cmd_setup(args):
-    """Download and install Android SDK components."""
+    """Download and install Android SDK components (and Kotlin compiler if configured)."""
     config = Config(args.config)
     sdk = SDKManager(config)
     sdk.setup()
+
+    if config.kotlin_version:
+        kotlin = KotlinManager(config)
+        kotlin.setup()
 
 
 def cmd_build(args):
@@ -625,6 +741,11 @@ def cmd_build(args):
     # Verify SDK is set up
     if not os.path.isfile(config.android_jar):
         print("Android SDK not found. Run './build.py setup' first.", file=sys.stderr)
+        sys.exit(1)
+
+    # Verify Kotlin compiler is set up (when configured)
+    if config.kotlin_version and not os.path.isfile(config.kotlinc_bin):
+        print("Kotlin compiler not found. Run './build.py setup' first.", file=sys.stderr)
         sys.exit(1)
 
     builder = Builder(config)

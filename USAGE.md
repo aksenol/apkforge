@@ -17,8 +17,9 @@ What happens:
 2. Extracts to `.android-sdk/cmdline-tools/latest/`
 3. Runs `sdkmanager` to install `build-tools;34.0.0` and `platforms;android-34`
 4. Auto-accepts SDK licenses
+5. If `kotlin.version` is set in `build.yaml`, downloads the Kotlin compiler from GitHub releases to `.kotlin/`
 
-The SDK is only downloaded once. Re-running `setup` skips already-installed components.
+The SDK and Kotlin compiler are only downloaded once. Re-running `setup` skips already-installed components.
 
 ### `./build.py build`
 
@@ -42,11 +43,11 @@ Removes the `.build/` directory and all intermediate artifacts.
 ./build.py clean
 ```
 
-This does **not** remove `.android-sdk/` or `debug.keystore`. To fully reset:
+This does **not** remove `.android-sdk/`, `.kotlin/`, or `debug.keystore`. To fully reset:
 
 ```bash
 ./build.py clean
-rm -rf .android-sdk/ debug.keystore
+rm -rf .android-sdk/ .kotlin/ debug.keystore
 ```
 
 ### Custom Config File
@@ -88,7 +89,18 @@ paths:
 
 Multiple source and resource directories are supported. All paths are relative to the directory containing `build.yaml`.
 
-### 3. Update AndroidManifest.xml
+### 3. Configure Kotlin (Optional)
+
+To use Kotlin, add a `kotlin` section to `build.yaml`:
+
+```yaml
+kotlin:
+  version: "2.0.21"
+```
+
+Then run `./build.py setup` to download the Kotlin compiler. Source directories can contain `.kt` files, `.java` files, or a mix of both. If no `.kt` files are found, the build uses `javac` only (backward compatible).
+
+### 4. Update AndroidManifest.xml
 
 Ensure the `package` attribute in your manifest matches `app.package` in `build.yaml`:
 
@@ -97,7 +109,7 @@ Ensure the `package` attribute in your manifest matches `app.package` in `build.
     package="com.mycompany.myapp">
 ```
 
-### 4. Build
+### 5. Build
 
 ```bash
 ./build.py build
@@ -176,7 +188,7 @@ Each step produces intermediate files in `.build/`:
 │   └── com/example/hello/
 │       └── R.java
 ├── base.apk               # Step 2: resources-only APK
-├── classes/                # Step 3: .class files from javac
+├── classes/                # Step 3: .class files from javac/kotlinc
 │   └── com/example/hello/
 │       ├── MainActivity.class
 │       └── R.class

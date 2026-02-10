@@ -17,6 +17,9 @@ paths:
     - sample/res
   libs: []
 
+kotlin:
+  version: "2.0.21"
+
 output:
   dir: .build
   apk_name: app-debug.apk
