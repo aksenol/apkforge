@@ -43,11 +43,11 @@ Removes the `.build/` directory and all intermediate artifacts.
 ./build.py clean
 ```
 
-This does **not** remove `.android-sdk/`, `.kotlin/`, or `debug.keystore`. To fully reset:
+This does **not** remove `.android-sdk/`, `.kotlin/`, `.deps/`, or `debug.keystore`. To fully reset:
 
 ```bash
 ./build.py clean
-rm -rf .android-sdk/ .kotlin/ debug.keystore
+rm -rf .android-sdk/ .kotlin/ .deps/ debug.keystore
 ```
 
 ### Custom Config File
@@ -115,7 +115,55 @@ Ensure the `package` attribute in your manifest matches `app.package` in `build.
 ./build.py build
 ```
 
-## Adding Java Dependencies
+## Adding Maven Dependencies
+
+Declare Maven coordinates in `build.yaml` under the `dependencies` section:
+
+```yaml
+repositories:
+  - https://dl.google.com/dl/android/maven2
+  - https://repo1.maven.org/maven2
+
+dependencies:
+  - androidx.appcompat:appcompat:1.7.0
+  - com.google.android.material:material:1.12.0
+```
+
+The build system will:
+1. Download POM files and resolve the full transitive dependency tree
+2. Download JAR and AAR artifacts from the configured repositories
+3. Extract AAR files (classes.jar, resources, manifest)
+4. Include dependency JARs in the compile classpath and DEX step
+5. Compile and link AAR resources with resource overlay merging
+6. Generate R classes for library packages
+
+Dependencies are cached in `.deps/` (versioned and immutable), so subsequent builds skip all downloads.
+
+### Cache Layout
+
+```
+.deps/
+├── poms/        # Downloaded POM files
+├── artifacts/   # Downloaded JAR/AAR files
+└── extracted/   # Extracted AAR contents (classes.jar, res/, AndroidManifest.xml)
+```
+
+### Supported Dependency Features
+
+- Transitive dependency resolution
+- Parent POM inheritance
+- BOM imports (`<type>pom</type>` + `<scope>import</scope>`)
+- `<dependencyManagement>` version pinning
+- Version range parsing (e.g., `[1.7.0]` → `1.7.0`)
+- Automatic skip of `test`, `provided`, `system` scoped and optional dependencies
+
+### Limitations
+
+- No manifest merging: the app manifest must declare all required components and themes
+- No ProGuard/R8 consumer rules from AARs
+- No version conflict resolution (first-seen version wins)
+
+## Adding Manual JAR Dependencies
 
 Place JAR files in a `libs/` directory (or anywhere you like) and list them in `build.yaml`:
 
@@ -126,7 +174,7 @@ paths:
     - libs/okhttp-4.12.jar
 ```
 
-These JARs are added to the `javac` classpath. The `.class` files from your source code are DEXed, but the JARs themselves are **not** automatically DEXed -- you would need to include them in the `d8` step for runtime use. For simple projects without external libraries, leave `libs` as `[]`.
+These JARs are added to the compile classpath and DEXed into the APK automatically. For simple projects without external libraries, leave `libs` as `[]`.
 
 ## Changing SDK Versions
 
@@ -177,13 +225,121 @@ To also install platform-tools via this build system, you can manually run:
 .android-sdk/platform-tools/adb install .build/app-debug.apk
 ```
 
+## Testing with the Android Emulator
+
+### Prerequisites
+
+Install the emulator, a system image, and platform-tools (~1.5 GB total):
+
+```bash
+.android-sdk/cmdline-tools/latest/bin/sdkmanager \
+  --sdk_root=.android-sdk \
+  "platform-tools" "emulator" "system-images;android-34;google_apis;x86_64"
+```
+
+On Ubuntu/Debian, the emulator also requires `libpulse0` (even with `-no-audio`):
+
+```bash
+sudo apt install -y libpulse0
+```
+
+### KVM Setup (Required for Usable Performance)
+
+Without KVM hardware acceleration, the emulator boots in 10-30 minutes. With KVM, boot takes ~48 seconds.
+
+**Linux (native):**
+```bash
+sudo modprobe kvm-intel   # Intel CPUs
+sudo modprobe kvm-amd     # AMD CPUs
+sudo chmod 666 /dev/kvm
+```
+
+**WSL2:**
+1. Create/edit `C:\Users\<username>\.wslconfig`:
+   ```ini
+   [wsl2]
+   nestedVirtualization=true
+   ```
+2. Restart WSL from Windows PowerShell: `wsl --shutdown`
+3. Reopen WSL and load the module:
+   ```bash
+   sudo modprobe kvm-intel
+   sudo chmod 666 /dev/kvm
+   ```
+
+Verify KVM is working:
+```bash
+ls -la /dev/kvm   # Should show crw-rw-rw-
+```
+
+### Create an AVD
+
+```bash
+echo "no" | .android-sdk/cmdline-tools/latest/bin/avdmanager create avd \
+  --name "test_device" \
+  --package "system-images;android-34;google_apis;x86_64" \
+  --device "pixel" --force
+```
+
+### Launch, Install, and Verify
+
+```bash
+# Launch emulator (with KVM)
+.android-sdk/emulator/emulator -avd test_device \
+  -gpu swiftshader_indirect -no-snapshot -no-audio &
+
+# Wait for full boot
+ADB=.android-sdk/platform-tools/adb
+$ADB wait-for-device
+while [ "$($ADB shell getprop sys.boot_completed 2>/dev/null)" != "1" ]; do sleep 5; done
+
+# Install and launch app
+$ADB install .build/app-debug.apk
+$ADB shell am start -n com.example.hello/.MainActivity
+
+# Verify app is running
+$ADB shell dumpsys activity activities | grep "topResumedActivity"
+
+# Take a screenshot
+$ADB shell screencap /sdcard/screen.png && \
+  $ADB pull /sdcard/screen.png .build/emulator-screenshot.png
+
+# Check for crashes
+$ADB logcat -d | grep -i "FATAL\|AndroidRuntime" | tail -n 10
+
+# Kill emulator when done
+$ADB emu kill
+```
+
+### Without KVM (Fallback)
+
+If KVM cannot be enabled, the emulator still works but is extremely slow:
+
+```bash
+.android-sdk/emulator/emulator -avd test_device \
+  -no-accel -no-window -gpu swiftshader_indirect \
+  -no-snapshot -no-audio -memory 2048 &
+```
+
+### Emulator Troubleshooting
+
+| Problem | Fix |
+|---------|-----|
+| `libpulse.so.0` not found | `sudo apt install -y libpulse0` |
+| `/dev/kvm` not found | Load module: `sudo modprobe kvm-intel` (Intel) or `kvm-amd` (AMD) |
+| `/dev/kvm` permission denied | `sudo chmod 666 /dev/kvm` |
+| WSL2: KVM still missing after `.wslconfig` | Run `wsl --shutdown` from Windows, then reopen WSL |
+| Emulator exits immediately | Check `libpulse0` is installed; verify system image matches AVD config |
+| Boot takes forever | Enable KVM — without it, expect 10-30 min boot times |
+
 ## Build Pipeline Details
 
 Each step produces intermediate files in `.build/`:
 
 ```
 .build/
-├── compiled_res/          # Step 1: .flat files from aapt2 compile
+├── compiled_res/          # Step 1: .flat files from app resources
+├── aar_compiled_res/      # Step 1: .flat files from AAR library resources
 ├── gen/                   # Step 2: R.java generated by aapt2 link
 │   └── com/example/hello/
 │       └── R.java
@@ -192,9 +348,10 @@ Each step produces intermediate files in `.build/`:
 │   └── com/example/hello/
 │       ├── MainActivity.class
 │       └── R.class
-├── dex/                    # Step 4: classes.dex from d8
-│   └── classes.dex
-├── dex.apk                 # Step 5: base.apk + classes.dex
+├── dex/                    # Step 4: DEX files from d8
+│   ├── classes.dex
+│   └── classes2.dex       # (when multi-DEX is needed)
+├── dex.apk                 # Step 5: base.apk + all DEX files
 ├── aligned.apk             # Step 6: zipaligned copy
 └── app-debug.apk           # Step 7: signed final APK
 ```

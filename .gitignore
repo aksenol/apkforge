@@ -2,3 +2,4 @@
 .android-sdk/
 .kotlin/
 *.keystore
+.deps/

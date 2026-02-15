@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.request
+import xml.etree.ElementTree as ET
 import zipfile
 
 # ---------------------------------------------------------------------------
@@ -179,6 +180,12 @@ class Config:
 
         self.sdk_dir = self._resolve(".android-sdk")
 
+        self.repositories = raw.get("repositories", [
+            "https://dl.google.com/dl/android/maven2",
+            "https://repo1.maven.org/maven2",
+        ])
+        self.dependencies = raw.get("dependencies", [])
+
         kotlin = raw.get("kotlin", {})
         self.kotlin_version = str(kotlin["version"]) if kotlin.get("version") else None
         self.kotlin_dir = self._resolve(".kotlin") if self.kotlin_version else None
@@ -217,6 +224,10 @@ class Config:
         if not self.kotlin_home:
             return None
         return os.path.join(self.kotlin_home, "lib", "kotlin-stdlib.jar")
+
+    @property
+    def deps_cache_dir(self):
+        return os.path.join(self.project_root, ".deps")
 
     def tool(self, name):
         """Return full path to a build-tools binary."""
@@ -408,6 +419,371 @@ class KotlinManager:
         print("Kotlin compiler installed.")
 
 
+# ---------------------------------------------------------------------------
+# Maven Dependency Resolver
+# ---------------------------------------------------------------------------
+
+class MavenResolver:
+    """Resolves Maven dependencies (including transitive), downloads JARs/AARs."""
+
+    _NS = "{http://maven.apache.org/POM/4.0.0}"
+
+    def __init__(self, config):
+        self.config = config
+        self.repos = config.repositories
+        self.cache_dir = config.deps_cache_dir
+        self.pom_dir = os.path.join(self.cache_dir, "poms")
+        self.artifact_dir = os.path.join(self.cache_dir, "artifacts")
+        self.extracted_dir = os.path.join(self.cache_dir, "extracted")
+
+        self._resolved = {}       # coord_key -> packaging
+        self._resolved_versions = {}  # coord_key -> version (for highest-wins)
+        self._version_map = {}    # (group, artifact) -> version from BOM/depMgmt
+        self._classpath_jars = []
+        self._dex_jars = []
+        self._aar_res_dirs = []
+        self._aar_packages = []
+
+    # -- public API ----------------------------------------------------------
+
+    def resolve_all(self, coords):
+        """Resolve a list of 'group:artifact:version' strings and all transitive deps."""
+        print("\nResolving Maven dependencies...")
+        for coord in coords:
+            self._resolve(coord)
+        print(f"  Resolved {len(self._resolved)} dependencies.")
+
+    def get_classpath_jars(self):
+        return list(self._classpath_jars)
+
+    def get_dex_jars(self):
+        return list(self._dex_jars)
+
+    def get_aar_res_dirs(self):
+        return list(self._aar_res_dirs)
+
+    def get_aar_packages(self):
+        return list(self._aar_packages)
+
+    # -- resolution ----------------------------------------------------------
+
+    @staticmethod
+    def _compare_versions(v1, v2):
+        """Compare two version strings. Returns >0 if v1>v2, 0 if equal, <0 if v1<v2."""
+        def parts(v):
+            return [int(p) if p.isdigit() else 0 for p in v.split(".")]
+        p1, p2 = parts(v1), parts(v2)
+        max_len = max(len(p1), len(p2))
+        p1 += [0] * (max_len - len(p1))
+        p2 += [0] * (max_len - len(p2))
+        for a, b in zip(p1, p2):
+            if a != b:
+                return a - b
+        return 0
+
+    def _unregister_artifact(self, group, artifact, version, packaging):
+        """Remove a previously registered artifact's entries (for version upgrades)."""
+        gpath = self._group_path(group)
+        if packaging == "aar":
+            extract_base = os.path.join(self.extracted_dir, gpath, artifact, version)
+            classes_jar = os.path.join(extract_base, "classes.jar")
+            if classes_jar in self._classpath_jars:
+                self._classpath_jars.remove(classes_jar)
+            if classes_jar in self._dex_jars:
+                self._dex_jars.remove(classes_jar)
+            res_dir = os.path.join(extract_base, "res")
+            if res_dir in self._aar_res_dirs:
+                self._aar_res_dirs.remove(res_dir)
+            manifest = os.path.join(extract_base, "AndroidManifest.xml")
+            if os.path.isfile(manifest):
+                pkg = self._read_aar_package(manifest)
+                if pkg and pkg in self._aar_packages:
+                    self._aar_packages.remove(pkg)
+        else:
+            rel = f"{gpath}/{artifact}/{version}/{artifact}-{version}.jar"
+            jar_path = os.path.join(self.artifact_dir, rel)
+            if jar_path in self._classpath_jars:
+                self._classpath_jars.remove(jar_path)
+            if jar_path in self._dex_jars:
+                self._dex_jars.remove(jar_path)
+
+    def _resolve(self, coord):
+        """Recursively resolve a single coordinate and its transitive deps."""
+        group, artifact, version = coord.split(":")
+        key = f"{group}:{artifact}"
+
+        if key in self._resolved:
+            old_ver = self._resolved_versions.get(key, "0.0.0")
+            if self._compare_versions(version, old_ver) <= 0:
+                return
+            # Higher version requested — unregister old artifact and re-resolve
+            self._unregister_artifact(group, artifact, old_ver, self._resolved[key])
+            del self._resolved[key]
+            del self._resolved_versions[key]
+
+        # Download and parse POM
+        pom_path = self._download_pom(group, artifact, version)
+        if not pom_path:
+            print(f"  WARNING: Could not download POM for {coord}", file=sys.stderr)
+            return
+
+        tree = ET.parse(pom_path)
+        root = tree.getroot()
+        packaging = self._pom_text(root, "packaging") or "jar"
+
+        # Merge parent dependencyManagement
+        self._process_parent(root)
+        # Merge local dependencyManagement (including BOM imports)
+        self._process_dep_management(root)
+
+        self._resolved[key] = packaging
+        self._resolved_versions[key] = version
+
+        # Download the actual artifact
+        self._download_artifact(group, artifact, version, packaging)
+
+        # Register classpath/resource entries
+        self._register_artifact(group, artifact, version, packaging)
+
+        # Resolve transitive dependencies
+        deps_el = root.find(f"{self._NS}dependencies")
+        if deps_el is not None:
+            for dep in deps_el.findall(f"{self._NS}dependency"):
+                dep_group = self._pom_text(dep, "groupId")
+                dep_artifact = self._pom_text(dep, "artifactId")
+                dep_scope = self._pom_text(dep, "scope") or "compile"
+                dep_optional = self._pom_text(dep, "optional") or "false"
+                dep_type = self._pom_text(dep, "type") or "jar"
+
+                # Skip non-compile scopes and optional deps
+                if dep_scope in ("test", "provided", "system"):
+                    continue
+                if dep_optional.lower() == "true":
+                    continue
+                # BOM imports are handled in depMgmt, not as real deps
+                if dep_type == "pom" and dep_scope == "import":
+                    continue
+
+                dep_version = self._pom_text(dep, "version")
+                if not dep_version:
+                    dep_version = self._version_map.get((dep_group, dep_artifact))
+                if not dep_version:
+                    print(f"  WARNING: No version for {dep_group}:{dep_artifact}, skipping",
+                          file=sys.stderr)
+                    continue
+
+                dep_version = self._clean_version(dep_version)
+                self._resolve(f"{dep_group}:{dep_artifact}:{dep_version}")
+
+    # -- POM helpers ---------------------------------------------------------
+
+    def _pom_text(self, element, tag):
+        """Get text of a direct child element, handling Maven namespace."""
+        el = element.find(f"{self._NS}{tag}")
+        if el is None:
+            # Try without namespace (some POMs omit it)
+            el = element.find(tag)
+        return el.text.strip() if el is not None and el.text else None
+
+    def _clean_version(self, version):
+        """Handle version ranges like [1.7.0] -> 1.7.0."""
+        if version and version.startswith("[") and version.endswith("]"):
+            version = version[1:-1]
+            if "," in version:
+                version = version.split(",")[0]
+        if version and version.startswith("["):
+            version = version[1:]
+        if version and version.endswith("]"):
+            version = version[:-1]
+        return version
+
+    def _process_parent(self, root):
+        """Fetch parent POM and merge its dependencyManagement."""
+        parent = root.find(f"{self._NS}parent")
+        if parent is None:
+            return
+        p_group = self._pom_text(parent, "groupId")
+        p_artifact = self._pom_text(parent, "artifactId")
+        p_version = self._pom_text(parent, "version")
+        if not all([p_group, p_artifact, p_version]):
+            return
+
+        pom_path = self._download_pom(p_group, p_artifact, p_version)
+        if not pom_path:
+            return
+
+        tree = ET.parse(pom_path)
+        parent_root = tree.getroot()
+        # Recursively process grandparent
+        self._process_parent(parent_root)
+        self._process_dep_management(parent_root)
+
+    def _process_dep_management(self, root):
+        """Extract version pins from <dependencyManagement>."""
+        dm = root.find(f"{self._NS}dependencyManagement")
+        if dm is None:
+            return
+        deps_el = dm.find(f"{self._NS}dependencies")
+        if deps_el is None:
+            return
+
+        for dep in deps_el.findall(f"{self._NS}dependency"):
+            g = self._pom_text(dep, "groupId")
+            a = self._pom_text(dep, "artifactId")
+            v = self._pom_text(dep, "version")
+            scope = self._pom_text(dep, "scope") or ""
+            dep_type = self._pom_text(dep, "type") or "jar"
+
+            if not all([g, a, v]):
+                continue
+
+            v = self._clean_version(v)
+
+            # BOM import: fetch that POM's dependencyManagement
+            if dep_type == "pom" and scope == "import":
+                bom_path = self._download_pom(g, a, v)
+                if bom_path:
+                    bom_tree = ET.parse(bom_path)
+                    bom_root = bom_tree.getroot()
+                    self._process_parent(bom_root)
+                    self._process_dep_management(bom_root)
+                continue
+
+            if (g, a) not in self._version_map:
+                self._version_map[(g, a)] = v
+
+    # -- downloads -----------------------------------------------------------
+
+    def _group_path(self, group):
+        return group.replace(".", "/")
+
+    def _download_pom(self, group, artifact, version):
+        """Download a POM file, returning its local path (or None on failure)."""
+        gpath = self._group_path(group)
+        rel = f"{gpath}/{artifact}/{version}/{artifact}-{version}.pom"
+        local_path = os.path.join(self.pom_dir, rel)
+
+        if os.path.isfile(local_path):
+            return local_path
+
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
+        for repo in self.repos:
+            url = f"{repo.rstrip('/')}/{rel}"
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                resp = urllib.request.urlopen(req)
+                with open(local_path, "wb") as f:
+                    f.write(resp.read())
+                return local_path
+            except urllib.error.HTTPError:
+                continue
+            except urllib.error.URLError:
+                continue
+
+        return None
+
+    def _download_artifact(self, group, artifact, version, packaging):
+        """Download a JAR or AAR artifact."""
+        ext = packaging if packaging in ("jar", "aar") else "jar"
+        gpath = self._group_path(group)
+        rel = f"{gpath}/{artifact}/{version}/{artifact}-{version}.{ext}"
+        local_path = os.path.join(self.artifact_dir, rel)
+
+        if os.path.isfile(local_path):
+            return local_path
+
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
+        for repo in self.repos:
+            url = f"{repo.rstrip('/')}/{rel}"
+            try:
+                print(f"  Downloading {group}:{artifact}:{version} ({ext})...")
+                _download_with_progress(url, local_path)
+                return local_path
+            except urllib.error.HTTPError:
+                if os.path.isfile(local_path):
+                    os.remove(local_path)
+                continue
+            except urllib.error.URLError:
+                if os.path.isfile(local_path):
+                    os.remove(local_path)
+                continue
+            except Exception:
+                if os.path.isfile(local_path):
+                    os.remove(local_path)
+                continue
+
+        print(f"  WARNING: Could not download {group}:{artifact}:{version}.{ext}",
+              file=sys.stderr)
+        return None
+
+    # -- artifact registration -----------------------------------------------
+
+    def _register_artifact(self, group, artifact, version, packaging):
+        """Register a downloaded artifact for classpath/dex/resource use."""
+        gpath = self._group_path(group)
+
+        if packaging == "aar":
+            self._extract_aar(group, artifact, version)
+            extract_base = os.path.join(
+                self.extracted_dir, gpath, artifact, version)
+            classes_jar = os.path.join(extract_base, "classes.jar")
+            if os.path.isfile(classes_jar):
+                self._classpath_jars.append(classes_jar)
+                self._dex_jars.append(classes_jar)
+            res_dir = os.path.join(extract_base, "res")
+            if os.path.isdir(res_dir) and os.listdir(res_dir):
+                self._aar_res_dirs.append(res_dir)
+            manifest = os.path.join(extract_base, "AndroidManifest.xml")
+            if os.path.isfile(manifest):
+                pkg = self._read_aar_package(manifest)
+                if pkg:
+                    self._aar_packages.append(pkg)
+        else:
+            rel = f"{gpath}/{artifact}/{version}/{artifact}-{version}.jar"
+            jar_path = os.path.join(self.artifact_dir, rel)
+            if os.path.isfile(jar_path):
+                self._classpath_jars.append(jar_path)
+                self._dex_jars.append(jar_path)
+
+    def _extract_aar(self, group, artifact, version):
+        """Extract classes.jar, res/, and AndroidManifest.xml from an AAR."""
+        gpath = self._group_path(group)
+        aar_path = os.path.join(
+            self.artifact_dir, gpath, artifact, version,
+            f"{artifact}-{version}.aar")
+        extract_base = os.path.join(
+            self.extracted_dir, gpath, artifact, version)
+
+        if os.path.isdir(extract_base) and os.path.isfile(
+                os.path.join(extract_base, "classes.jar")):
+            return  # Already extracted
+
+        os.makedirs(extract_base, exist_ok=True)
+
+        if not os.path.isfile(aar_path):
+            return
+
+        with zipfile.ZipFile(aar_path, "r") as zf:
+            for entry in zf.namelist():
+                if entry == "classes.jar":
+                    zf.extract(entry, extract_base)
+                elif entry == "AndroidManifest.xml":
+                    zf.extract(entry, extract_base)
+                elif entry.startswith("res/"):
+                    zf.extract(entry, extract_base)
+
+    def _read_aar_package(self, manifest_path):
+        """Read the package name from an AAR's AndroidManifest.xml."""
+        try:
+            tree = ET.parse(manifest_path)
+            root = tree.getroot()
+            return root.get("package")
+        except ET.ParseError:
+            return None
+
+
 def _download_with_progress(url, dest):
     """Download a URL to a local file with a simple progress indicator."""
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -477,9 +853,11 @@ class Builder:
     def __init__(self, config):
         self.cfg = config
         self.keystore = DebugKeystore(config)
+        self.resolver = None
 
         # Intermediate directories
         self.compiled_res_dir = os.path.join(config.build_dir, "compiled_res")
+        self.aar_compiled_res_dir = os.path.join(config.build_dir, "aar_compiled_res")
         self.gen_dir = os.path.join(config.build_dir, "gen")
         self.classes_dir = os.path.join(config.build_dir, "classes")
         self.dex_dir = os.path.join(config.build_dir, "dex")
@@ -494,6 +872,11 @@ class Builder:
         self.cfg.validate()
         self._prepare_dirs()
 
+        # Step 0: Resolve Maven dependencies
+        if self.cfg.dependencies:
+            self.resolver = MavenResolver(self.cfg)
+            self.resolver.resolve_all(self.cfg.dependencies)
+
         self._step1_compile_resources()
         self._step2_link_resources()
         self._step3_compile_sources()
@@ -505,7 +888,11 @@ class Builder:
         print(f"\nBuild successful: {self.final_apk}")
 
     def _prepare_dirs(self):
-        for d in (self.compiled_res_dir, self.gen_dir, self.classes_dir, self.dex_dir):
+        for d in (self.compiled_res_dir, self.aar_compiled_res_dir):
+            if os.path.isdir(d):
+                shutil.rmtree(d)
+        for d in (self.compiled_res_dir, self.aar_compiled_res_dir,
+                  self.gen_dir, self.classes_dir, self.dex_dir):
             os.makedirs(d, exist_ok=True)
 
     # Step 1: aapt2 compile
@@ -522,6 +909,15 @@ class Builder:
                         [aapt2, "compile", "-o", self.compiled_res_dir, fpath],
                         "aapt2 compile",
                     )
+
+        # Compile AAR resources: one zip archive per library to avoid filename collisions
+        if self.resolver:
+            for idx, res_dir in enumerate(self.resolver.get_aar_res_dirs()):
+                zip_out = os.path.join(self.aar_compiled_res_dir, f"aar_{idx}.zip")
+                _run(
+                    [aapt2, "compile", "--dir", res_dir, "-o", zip_out],
+                    "aapt2 compile (AAR)",
+                )
 
     # Step 2: aapt2 link
     def _step2_link_resources(self):
@@ -542,7 +938,19 @@ class Builder:
             "--version-name", self.cfg.version_name,
             "-o", self.base_apk,
         ]
+
+        # Include AAR compiled resources as overlays to resolve cross-library conflicts
+        if self.resolver:
+            aar_zips = glob.glob(os.path.join(self.aar_compiled_res_dir, "*.zip"))
+            if aar_zips:
+                cmd.append("--auto-add-overlay")
+            for pkg in self.resolver.get_aar_packages():
+                cmd += ["--extra-packages", pkg]
+
         cmd += flat_files
+        if self.resolver and aar_zips:
+            for z in aar_zips:
+                cmd += ["-R", z]
         _run(cmd, "aapt2 link")
 
     # Step 3: compile sources (Java and/or Kotlin)
@@ -568,6 +976,8 @@ class Builder:
 
         sep = ";" if platform.system() == "Windows" else ":"
         classpath_parts = [self.cfg.android_jar] + self.cfg.libs
+        if self.resolver:
+            classpath_parts += self.resolver.get_classpath_jars()
 
         if not kt_files:
             # Java-only path (backward compatible)
@@ -642,20 +1052,37 @@ class Builder:
         if self.cfg.kotlin_version and self.cfg.kotlin_stdlib:
             cmd.append(self.cfg.kotlin_stdlib)
 
+        # Include dependency JARs and manual libs
+        if self.resolver:
+            dep_jars = self.resolver.get_dex_jars()
+            # Exclude transitive kotlin-stdlib JARs — the compiler bundles its own
+            if self.cfg.kotlin_stdlib:
+                dep_jars = [j for j in dep_jars
+                            if not os.path.basename(j).startswith("kotlin-stdlib")]
+            cmd += dep_jars
+        cmd += self.cfg.libs
+
         _run(cmd, "d8")
 
-    # Step 5: Inject classes.dex into APK via Python zipfile
+    # Step 5: Inject classes.dex (and classesN.dex for multi-DEX) into APK
     def _step5_inject_dex(self):
         print("[5/7] Injecting DEX into APK...")
-        dex_file = os.path.join(self.dex_dir, "classes.dex")
-        if not os.path.isfile(dex_file):
-            print(f"  DEX file not found: {dex_file}", file=sys.stderr)
+
+        # Glob for all DEX files (classes.dex, classes2.dex, ...)
+        dex_files = sorted(glob.glob(os.path.join(self.dex_dir, "classes*.dex")))
+        if not dex_files:
+            print(f"  No DEX files found in {self.dex_dir}", file=sys.stderr)
             sys.exit(1)
 
         shutil.copy2(self.base_apk, self.dex_apk)
 
         with zipfile.ZipFile(self.dex_apk, "a") as zf:
-            zf.write(dex_file, "classes.dex")
+            for dex_file in dex_files:
+                arcname = os.path.basename(dex_file)
+                zf.write(dex_file, arcname)
+
+        if len(dex_files) > 1:
+            print(f"  Multi-DEX: injected {len(dex_files)} DEX files.")
 
     # Step 6: zipalign
     def _step6_zipalign(self):
