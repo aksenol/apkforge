@@ -1,6 +1,6 @@
 # Minimal Android APK Build System
 
-A single-file, zero-dependency Python build tool that produces debug Android APKs from a declarative YAML config. Supports both Java and Kotlin sources, with automatic Maven dependency resolution for AndroidX and other libraries.
+A single-file, zero-dependency Python build tool that produces debug Android APKs from a declarative YAML config. Supports both Java and Kotlin sources with Jetpack Compose, and automatic Maven dependency resolution for AndroidX and other libraries.
 
 ## Prerequisites
 
@@ -21,12 +21,11 @@ A single-file, zero-dependency Python build tool that produces debug Android APK
 ```
 ├── build.py                              # Build tool (single file, ~1100 lines)
 ├── build.yaml                            # Declarative project config
-├── sample/                               # Sample app (Kotlin + AppCompatActivity)
+├── sample/                               # Sample app (Kotlin + Jetpack Compose)
 │   ├── AndroidManifest.xml
 │   ├── src/com/example/hello/
 │   │   └── MainActivity.kt
 │   └── res/
-│       ├── layout/activity_main.xml
 │       └── values/strings.xml
 ├── .build/                               # Build artifacts (gitignored)
 ├── .android-sdk/                         # Downloaded SDK (gitignored)
@@ -43,7 +42,7 @@ A single-file, zero-dependency Python build tool that produces debug Android APK
 | `mini_yaml_load()` | Built-in YAML parser fallback (uses PyYAML when available) |
 | `Config` | Loads `build.yaml`, validates paths, resolves relative paths, applies defaults |
 | `SDKManager` | Downloads cmdline-tools, installs build-tools and platform via `sdkmanager` |
-| `KotlinManager` | Downloads and installs the Kotlin compiler from GitHub releases |
+| `KotlinManager` | Downloads and installs the Kotlin compiler and Compose plugin from GitHub releases / Maven Central |
 | `MavenResolver` | Resolves Maven dependencies (transitive), downloads JARs/AARs, extracts AARs |
 | `DebugKeystore` | Auto-generates `debug.keystore` via `keytool` on first build |
 | `Builder` | Executes the 7-step APK build pipeline (with dependency integration) |
@@ -55,7 +54,7 @@ A single-file, zero-dependency Python build tool that produces debug Android APK
 | 0 | `MavenResolver` | Resolve Maven dependencies, download POMs/JARs/AARs, extract AARs |
 | 1 | `aapt2 compile` | Compile app + AAR resource files to `.flat` binary format |
 | 2 | `aapt2 link` | Link flat resources (with overlay merging), generate `R.java`, produce base APK |
-| 3 | `javac` / `kotlinc` | Compile Java/Kotlin sources + `R.java` against `android.jar` + dependency JARs |
+| 3 | `javac` / `kotlinc` | Compile Java/Kotlin sources + `R.java` against `android.jar` + dependency JARs (with `-Xplugin` for Compose) |
 | 4 | `d8` | Convert `.class` files + dependency JARs + `kotlin-stdlib.jar` to DEX (multi-DEX supported) |
 | 5 | Python `zipfile` | Inject `classes.dex` (and `classes2.dex`, etc.) into the APK |
 | 6 | `zipalign` | 4-byte align uncompressed entries for memory-mapped access |
@@ -87,6 +86,7 @@ A single-file, zero-dependency Python build tool that produces debug Android APK
 - **`d8` not `dx`** -- `dx` is deprecated. `d8` is the modern DEX compiler included in build-tools 28+.
 - **Python `zipfile` for DEX injection** -- Avoids the deprecated `aapt` v1 `add` command. Standard library, no extra tools.
 - **Kotlin support** -- Optional. When `kotlin.version` is set in `build.yaml`, the Kotlin compiler is auto-downloaded during setup. Mixed Java/Kotlin projects are supported. Java-only projects work unchanged when the `kotlin:` section is omitted.
+- **Jetpack Compose support** -- Optional. Set `compose: true` under the `kotlin:` section. The Compose compiler plugin JAR (`kotlin-compose-compiler-plugin`) is downloaded from Maven Central during setup and passed to `kotlinc` via `-Xplugin`. Since Kotlin 2.0+, the plugin version matches the Kotlin version exactly. Compose UI libraries are standard Maven artifacts — no special resource processing or DEX handling needed.
 - **Java 1.8 source/target** -- Maximum compatibility across Android API levels.
 - **SDK in project directory** -- Installed to `.android-sdk/`, `.kotlin/`, and `.deps/` inside the project root. Self-contained, no system-wide side effects, easy to delete.
 - **Debug builds only** -- No ProGuard/R8 shrinking, no release signing. Keeps the tool focused and simple.
@@ -109,6 +109,7 @@ sdk:
 
 kotlin:
   version: "2.0.21"            # Optional: omit section for Java-only projects
+  compose: true                # Optional: enable Jetpack Compose compiler plugin
 
 repositories:                             # Maven repositories (defaults shown)
   - https://dl.google.com/dl/android/maven2   # Google Maven (AndroidX)
@@ -200,6 +201,7 @@ sudo apt install -y libpulse0
 | `javac` not found | Install JDK 8+ and ensure `JAVA_HOME/bin` is on `PATH` |
 | `keytool` not found | Same as above -- `keytool` ships with every JDK |
 | Kotlin compiler not found | Run `./build.py setup` with `kotlin.version` set in `build.yaml` |
+| Compose plugin not found | Run `./build.py setup` with `compose: true` under `kotlin:` in `build.yaml` |
 | SDK download fails | Check internet connection; retry `./build.py setup` |
 | `aapt2 link` fails | Ensure `AndroidManifest.xml` `package` matches `build.yaml` `app.package` |
 | `d8` fails with unsupported class version | Compile with JDK 11 or lower, or use `--release 8` if on JDK 17+ |

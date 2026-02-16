@@ -18,6 +18,7 @@ What happens:
 3. Runs `sdkmanager` to install `build-tools;34.0.0` and `platforms;android-34`
 4. Auto-accepts SDK licenses
 5. If `kotlin.version` is set in `build.yaml`, downloads the Kotlin compiler from GitHub releases to `.kotlin/`
+6. If `compose: true` is set, downloads the Compose compiler plugin JAR to `.kotlin/compose-plugin/`
 
 The SDK and Kotlin compiler are only downloaded once. Re-running `setup` skips already-installed components.
 
@@ -99,6 +100,42 @@ kotlin:
 ```
 
 Then run `./build.py setup` to download the Kotlin compiler. Source directories can contain `.kt` files, `.java` files, or a mix of both. If no `.kt` files are found, the build uses `javac` only (backward compatible).
+
+### 3b. Enabling Jetpack Compose (Optional)
+
+[Jetpack Compose](https://developer.android.com/compose) is Android's modern declarative UI toolkit. It works as a Kotlin compiler plugin — the `@Composable` annotation triggers code transformation at compile time.
+
+To enable Compose, set `compose: true` under the `kotlin` section and add Compose dependencies:
+
+```yaml
+kotlin:
+  version: "2.1.20"
+  compose: true
+
+dependencies:
+  - androidx.activity:activity-compose:1.10.1
+  - androidx.compose.ui:ui:1.7.8
+  - androidx.compose.foundation:foundation:1.7.8
+  - androidx.compose.material3:material3:1.3.2
+```
+
+Then run setup and build:
+
+```bash
+./build.py setup   # Downloads Kotlin compiler + Compose plugin JAR
+./build.py build   # Builds APK with Compose support
+```
+
+**How it works:**
+- `./build.py setup` downloads `kotlin-compose-compiler-plugin-<version>.jar` from Maven Central to `.kotlin/compose-plugin/`
+- During compilation, the plugin JAR is passed to `kotlinc` via `-Xplugin`, enabling `@Composable` code transformation
+- Since Kotlin 2.0+, the Compose compiler plugin version matches the Kotlin version exactly
+- Compose UI libraries (ui, foundation, material3) are standard Maven artifacts handled by the existing dependency resolver
+
+**Requirements:**
+- `kotlin.version` must be set (Compose is a Kotlin compiler plugin)
+- Kotlin 2.0+ recommended (plugin version matches Kotlin version)
+- Use `ComponentActivity` instead of `AppCompatActivity` as your base class
 
 ### 4. Update AndroidManifest.xml
 

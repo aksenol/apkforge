@@ -189,6 +189,7 @@ class Config:
         kotlin = raw.get("kotlin", {})
         self.kotlin_version = str(kotlin["version"]) if kotlin.get("version") else None
         self.kotlin_dir = self._resolve(".kotlin") if self.kotlin_version else None
+        self.compose_enabled = bool(kotlin.get("compose", False))
 
     def _resolve(self, path):
         if os.path.isabs(path):
@@ -224,6 +225,13 @@ class Config:
         if not self.kotlin_home:
             return None
         return os.path.join(self.kotlin_home, "lib", "kotlin-stdlib.jar")
+
+    @property
+    def compose_plugin_jar(self):
+        if not self.kotlin_dir or not self.compose_enabled:
+            return None
+        return os.path.join(self.kotlin_dir, "compose-plugin",
+            f"kotlin-compose-compiler-plugin-{self.kotlin_version}.jar")
 
     @property
     def deps_cache_dir(self):
@@ -392,31 +400,51 @@ class KotlinManager:
         """Download and extract the Kotlin compiler if not already present."""
         if self.kotlinc_bin and os.path.isfile(self.kotlinc_bin):
             print("Kotlin compiler already present, skipping download.")
+        else:
+            url = self._URL_TEMPLATE.format(version=self.version)
+            print(f"Downloading Kotlin compiler {self.version}...")
+
+            os.makedirs(self.kotlin_dir, exist_ok=True)
+            zip_path = os.path.join(self.kotlin_dir, "kotlin-compiler.zip")
+            _download_with_progress(url, zip_path)
+
+            print("Extracting Kotlin compiler...")
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(self.kotlin_dir)
+
+            os.remove(zip_path)
+
+            # Make binaries executable on Unix
+            if platform.system() != "Windows":
+                bin_dir = os.path.join(self.kotlin_home, "bin")
+                if os.path.isdir(bin_dir):
+                    for f in os.listdir(bin_dir):
+                        fp = os.path.join(bin_dir, f)
+                        st = os.stat(fp)
+                        os.chmod(fp, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+            print("Kotlin compiler installed.")
+
+        if self.config.compose_enabled:
+            self._setup_compose()
+
+    def _setup_compose(self):
+        """Download the Compose compiler plugin JAR from Maven Central."""
+        jar_path = self.config.compose_plugin_jar
+        if os.path.isfile(jar_path):
+            print("Compose compiler plugin already present, skipping download.")
             return
 
-        url = self._URL_TEMPLATE.format(version=self.version)
-        print(f"Downloading Kotlin compiler {self.version}...")
+        url = (
+            f"https://repo1.maven.org/maven2/org/jetbrains/kotlin/"
+            f"kotlin-compose-compiler-plugin/{self.version}/"
+            f"kotlin-compose-compiler-plugin-{self.version}.jar"
+        )
+        print(f"Downloading Compose compiler plugin {self.version}...")
 
-        os.makedirs(self.kotlin_dir, exist_ok=True)
-        zip_path = os.path.join(self.kotlin_dir, "kotlin-compiler.zip")
-        _download_with_progress(url, zip_path)
-
-        print("Extracting Kotlin compiler...")
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(self.kotlin_dir)
-
-        os.remove(zip_path)
-
-        # Make binaries executable on Unix
-        if platform.system() != "Windows":
-            bin_dir = os.path.join(self.kotlin_home, "bin")
-            if os.path.isdir(bin_dir):
-                for f in os.listdir(bin_dir):
-                    fp = os.path.join(bin_dir, f)
-                    st = os.stat(fp)
-                    os.chmod(fp, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-
-        print("Kotlin compiler installed.")
+        os.makedirs(os.path.dirname(jar_path), exist_ok=True)
+        _download_with_progress(url, jar_path)
+        print("Compose compiler plugin installed.")
 
 
 # ---------------------------------------------------------------------------
@@ -784,6 +812,48 @@ class MavenResolver:
             return None
 
 
+def _deduplicate_jars(jar_paths):
+    """Remove JARs whose .class entries are all contained in other JARs.
+
+    AndroidX merged many -ktx artifacts into their main modules (e.g.
+    collection-ktx was merged into collection-jvm at version 1.4.0).
+    When both old and new artifacts are pulled in as transitive deps,
+    d8 fails on duplicate class definitions.  This function detects
+    JARs that are strict subsets of other JARs and removes them.
+    """
+    # Build a map: jar_path -> set of .class entry names
+    jar_classes = {}
+    for jar in jar_paths:
+        try:
+            with zipfile.ZipFile(jar, "r") as zf:
+                classes = {n for n in zf.namelist() if n.endswith(".class")}
+            jar_classes[jar] = classes
+        except (zipfile.BadZipFile, OSError):
+            jar_classes[jar] = set()
+
+    # Find JARs whose classes are a strict subset of another JAR's classes
+    to_remove = set()
+    jars = list(jar_classes.keys())
+    for i, jar_a in enumerate(jars):
+        if not jar_classes[jar_a]:
+            continue
+        for j, jar_b in enumerate(jars):
+            if i == j or jar_b in to_remove:
+                continue
+            if not jar_classes[jar_b]:
+                continue
+            # If all of A's classes exist in B, and B has more, A is redundant
+            if jar_classes[jar_a] <= jar_classes[jar_b] and len(jar_classes[jar_a]) < len(jar_classes[jar_b]):
+                to_remove.add(jar_a)
+                break
+
+    if to_remove:
+        for jar in sorted(to_remove):
+            print(f"  Excluding redundant JAR: {os.path.basename(jar)}")
+
+    return [j for j in jar_paths if j not in to_remove]
+
+
 def _download_with_progress(url, dest):
     """Download a URL to a local file with a simple progress indicator."""
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -1025,6 +1095,8 @@ class Builder:
                 "-jvm-target", "1.8",
                 "-no-stdlib",
             ]
+            if self.cfg.compose_enabled:
+                cmd.append("-Xplugin=" + self.cfg.compose_plugin_jar)
             cmd += kt_files + user_java_files
             _run(cmd, "kotlinc")
 
@@ -1059,6 +1131,9 @@ class Builder:
             if self.cfg.kotlin_stdlib:
                 dep_jars = [j for j in dep_jars
                             if not os.path.basename(j).startswith("kotlin-stdlib")]
+            # Deduplicate JARs that contain overlapping classes (e.g. AndroidX
+            # merged -ktx artifacts into main modules in newer versions)
+            dep_jars = _deduplicate_jars(dep_jars)
             cmd += dep_jars
         cmd += self.cfg.libs
 
@@ -1174,6 +1249,16 @@ def cmd_build(args):
     if config.kotlin_version and not os.path.isfile(config.kotlinc_bin):
         print("Kotlin compiler not found. Run './build.py setup' first.", file=sys.stderr)
         sys.exit(1)
+
+    # Verify Compose setup
+    if config.compose_enabled:
+        if not config.kotlin_version:
+            print("Compose requires kotlin.version to be set in build.yaml.", file=sys.stderr)
+            sys.exit(1)
+        if not os.path.isfile(config.compose_plugin_jar):
+            print("Compose compiler plugin not found. Run './build.py setup' first.",
+                  file=sys.stderr)
+            sys.exit(1)
 
     builder = Builder(config)
     builder.build()
