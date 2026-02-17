@@ -8,6 +8,7 @@ packaging, alignment, and signing.
 Usage:
     ./build.py setup   - Download and install Android SDK components
     ./build.py build   - Build the APK
+    ./build.py preview - Render @Preview composables to PNG via layoutlib
     ./build.py clean   - Remove build artifacts
 """
 
@@ -15,6 +16,7 @@ import argparse
 import glob
 import os
 import platform
+import re
 import shutil
 import stat
 import subprocess
@@ -191,6 +193,12 @@ class Config:
         self.kotlin_dir = self._resolve(".kotlin") if self.kotlin_version else None
         self.compose_enabled = bool(kotlin.get("compose", False))
 
+        preview = raw.get("preview", {})
+        self.preview_width = int(preview.get("width", 1080))
+        self.preview_height = int(preview.get("height", 2340))
+        self.preview_density = int(preview.get("density", 420))
+        self.preview_theme = str(preview.get("theme", "android:Theme.Material.Light.NoActionBar"))
+
     def _resolve(self, path):
         if os.path.isabs(path):
             return path
@@ -236,6 +244,14 @@ class Config:
     @property
     def deps_cache_dir(self):
         return os.path.join(self.project_root, ".deps")
+
+    @property
+    def layoutlib_dir(self):
+        return os.path.join(self.project_root, ".layoutlib")
+
+    @property
+    def preview_output_dir(self):
+        return os.path.join(self.build_dir, "previews")
 
     def tool(self, name):
         """Return full path to a build-tools binary."""
@@ -445,6 +461,189 @@ class KotlinManager:
         os.makedirs(os.path.dirname(jar_path), exist_ok=True)
         _download_with_progress(url, jar_path)
         print("Compose compiler plugin installed.")
+
+
+# ---------------------------------------------------------------------------
+# Layoutlib Manager
+# ---------------------------------------------------------------------------
+
+class LayoutlibManager:
+    """Downloads layoutlib artifacts for host-side Compose preview rendering."""
+
+    _LAYOUTLIB_API_VERSION = "32.0.0"
+    _LAYOUTLIB_VERSION = "16.2.1"
+    _KXML2_VERSION = "2.3.0"
+    _GUAVA_VERSION = "33.4.0-jre"
+
+    _GOOGLE_MAVEN = "https://dl.google.com/dl/android/maven2"
+    _MAVEN_CENTRAL = "https://repo1.maven.org/maven2"
+
+    def __init__(self, config):
+        self.config = config
+        self.base_dir = config.layoutlib_dir
+
+    # -- JAR paths -----------------------------------------------------------
+
+    @property
+    def api_jar(self):
+        return os.path.join(self.base_dir,
+            f"layoutlib-api-{self._LAYOUTLIB_API_VERSION}.jar")
+
+    @property
+    def impl_jar(self):
+        return os.path.join(self.base_dir,
+            f"layoutlib-{self._LAYOUTLIB_VERSION}.jar")
+
+    @property
+    def runtime_jar(self):
+        return os.path.join(self.base_dir,
+            f"layoutlib-runtime-{self._LAYOUTLIB_VERSION}-linux.jar")
+
+    @property
+    def resources_jar(self):
+        return os.path.join(self.base_dir,
+            f"layoutlib-resources-{self._LAYOUTLIB_VERSION}.jar")
+
+    @property
+    def kxml2_jar(self):
+        return os.path.join(self.base_dir, f"kxml2-{self._KXML2_VERSION}.jar")
+
+    @property
+    def guava_jar(self):
+        return os.path.join(self.base_dir, f"guava-{self._GUAVA_VERSION}.jar")
+
+    @property
+    def runtime_dir(self):
+        return os.path.join(self.base_dir, "runtime")
+
+    @property
+    def resources_dir(self):
+        return os.path.join(self.base_dir, "resources")
+
+    # -- setup ---------------------------------------------------------------
+
+    def setup(self):
+        """Download and extract all layoutlib artifacts."""
+        os.makedirs(self.base_dir, exist_ok=True)
+        print("\nSetting up layoutlib for preview rendering...")
+
+        self._download(
+            "layoutlib-api",
+            f"{self._GOOGLE_MAVEN}/com/android/tools/layoutlib/layoutlib-api/"
+            f"{self._LAYOUTLIB_API_VERSION}/layoutlib-api-{self._LAYOUTLIB_API_VERSION}.jar",
+            self.api_jar)
+        self._download(
+            "layoutlib",
+            f"{self._GOOGLE_MAVEN}/com/android/tools/layoutlib/layoutlib/"
+            f"{self._LAYOUTLIB_VERSION}/layoutlib-{self._LAYOUTLIB_VERSION}.jar",
+            self.impl_jar)
+        self._download(
+            "layoutlib-runtime (linux)",
+            f"{self._GOOGLE_MAVEN}/com/android/tools/layoutlib/layoutlib-runtime/"
+            f"{self._LAYOUTLIB_VERSION}/"
+            f"layoutlib-runtime-{self._LAYOUTLIB_VERSION}-linux.jar",
+            self.runtime_jar)
+        self._download(
+            "layoutlib-resources",
+            f"{self._GOOGLE_MAVEN}/com/android/tools/layoutlib/layoutlib-resources/"
+            f"{self._LAYOUTLIB_VERSION}/"
+            f"layoutlib-resources-{self._LAYOUTLIB_VERSION}.jar",
+            self.resources_jar)
+        self._download(
+            "kxml2",
+            f"{self._MAVEN_CENTRAL}/net/sf/kxml/kxml2/"
+            f"{self._KXML2_VERSION}/kxml2-{self._KXML2_VERSION}.jar",
+            self.kxml2_jar)
+        self._download(
+            "guava",
+            f"{self._MAVEN_CENTRAL}/com/google/guava/guava/"
+            f"{self._GUAVA_VERSION}/guava-{self._GUAVA_VERSION}.jar",
+            self.guava_jar)
+
+        self._extract_runtime()
+        self._extract_resources()
+        print("Layoutlib setup complete.")
+
+    def _download(self, name, url, dest):
+        if os.path.isfile(dest):
+            print(f"  {name} already present.")
+            return
+        print(f"  Downloading {name}...")
+        _download_with_progress(url, dest)
+
+    def _extract_runtime(self):
+        """Extract native libs, fonts, ICU data from runtime JAR."""
+        if os.path.isdir(self.runtime_dir):
+            return
+        print("  Extracting layoutlib runtime...")
+        with zipfile.ZipFile(self.runtime_jar, "r") as zf:
+            zf.extractall(self.runtime_dir)
+
+    def _extract_resources(self):
+        """Extract framework res/ from resources JAR."""
+        if os.path.isdir(self.resources_dir):
+            return
+        print("  Extracting layoutlib resources...")
+        with zipfile.ZipFile(self.resources_jar, "r") as zf:
+            zf.extractall(self.resources_dir)
+
+    # -- path accessors for the renderer ------------------------------------
+
+    def get_host_classpath(self):
+        """Return JARs needed on the host-side renderer classpath."""
+        return [self.api_jar, self.impl_jar, self.kxml2_jar, self.guava_jar]
+
+    def get_native_lib_path(self):
+        """Return directory containing native .so files."""
+        for sub in ("data/linux/lib64", "data/linux/lib", "linux/lib64", "lib64"):
+            path = os.path.join(self.runtime_dir, sub)
+            if os.path.isdir(path):
+                return path
+        return self.runtime_dir
+
+    def get_font_dir(self):
+        """Return directory containing font files."""
+        for sub in ("data/fonts", "fonts"):
+            path = os.path.join(self.runtime_dir, sub)
+            if os.path.isdir(path):
+                return path
+        return self.runtime_dir
+
+    def get_icu_data_path(self):
+        """Return path to the ICU data file."""
+        for root, _dirs, files in os.walk(self.runtime_dir):
+            for f in files:
+                if f.startswith("icudt") and f.endswith(".dat"):
+                    return os.path.join(root, f)
+        return self.runtime_dir
+
+    def get_hyphen_data_dir(self):
+        """Return directory containing hyphenation data."""
+        for sub in ("data/hyphen-data", "hyphen-data"):
+            path = os.path.join(self.runtime_dir, sub)
+            if os.path.isdir(path):
+                return path
+        return ""
+
+    def get_keyboard_paths(self):
+        """Return list of keyboard data file paths."""
+        for sub in ("data/keyboards", "keyboards"):
+            path = os.path.join(self.runtime_dir, sub)
+            if os.path.isdir(path):
+                return [os.path.join(path, f)
+                        for f in os.listdir(path) if os.path.isfile(os.path.join(path, f))]
+        return []
+
+    def get_build_prop(self):
+        """Return path to build.prop if it exists."""
+        prop = os.path.join(self.runtime_dir, "build.prop")
+        if os.path.isfile(prop):
+            return prop
+        return None
+
+    def get_framework_res_dir(self):
+        """Return directory containing framework resources."""
+        return self.resources_dir
 
 
 # ---------------------------------------------------------------------------
@@ -914,6 +1113,397 @@ class DebugKeystore:
 
 
 # ---------------------------------------------------------------------------
+# Embedded Compose Preview Renderer (Kotlin source)
+# ---------------------------------------------------------------------------
+
+PREVIEW_RENDERER_KT = r'''package preview
+
+import com.android.ide.common.rendering.api.*
+import com.android.layoutlib.bridge.Bridge
+import com.android.resources.Density
+import com.android.resources.ResourceType
+import com.android.resources.ScreenOrientation
+import com.android.resources.ScreenRound
+import com.android.resources.ScreenSize
+import java.awt.image.BufferedImage
+import java.io.File
+import java.io.StringReader
+import javax.imageio.ImageIO
+import javax.xml.parsers.DocumentBuilderFactory
+import org.kxml2.io.KXmlParser
+import org.xmlpull.v1.XmlPullParser
+
+fun main(args: Array<String>) {
+    if (args.size < 13) {
+        System.err.println(
+            "Usage: preview.PreviewRendererKt <classesDir> <nativeLibPath> " +
+            "<fontDir> <icuData> <hyphenData> <buildPropPath> <fwResDir> " +
+            "<outputDir> <width> <height> <density> <keyboardPaths> " +
+            "<fqn1> [fqn2 ...]"
+        )
+        System.exit(1)
+    }
+    val classesDir = args[0]
+    val nativeLibPath = args[1]
+    val fontDir = args[2]
+    val icuData = args[3]
+    val hyphenData = args[4]
+    val buildPropPath = args[5]
+    val fwResDir = args[6]
+    val outputDir = File(args[7])
+    val width = args[8].toInt()
+    val height = args[9].toInt()
+    val density = args[10].toInt()
+    val keyboardPaths = if (args[11].isEmpty()) emptyArray()
+                        else args[11].split(File.pathSeparator).toTypedArray()
+    val fqns = args.drop(12)
+
+    outputDir.mkdirs()
+
+    // Load platform properties from build.prop
+    val props = mutableMapOf<String, String>()
+    val buildProp = File(buildPropPath)
+    if (buildProp.isFile) {
+        buildProp.readLines().filter { '=' in it && !it.startsWith('#') }.forEach {
+            val i = it.indexOf('=')
+            props[it.substring(0, i).trim()] = it.substring(i + 1).trim()
+        }
+    }
+    props.putIfAbsent("ro.build.version.sdk", "34")
+
+    // Build enum value map for Bridge - essential layout enum values
+    val enumValueMap = mutableMapOf<String, MutableMap<String, Int>>()
+    val attrsFile = File(fwResDir, "res/values/attrs.xml")
+    if (attrsFile.isFile) {
+        val dbf = DocumentBuilderFactory.newInstance()
+        val doc = dbf.newDocumentBuilder().parse(attrsFile)
+        val attrs = doc.getElementsByTagName("attr")
+        for (i in 0 until attrs.length) {
+            val attr = attrs.item(i) as org.w3c.dom.Element
+            val attrName = attr.getAttribute("name").takeIf { it.isNotEmpty() } ?: continue
+            // Only process attrs that have a format attribute (i.e., are definitions, not references)
+            if (!attr.hasAttribute("format")) continue
+            val values = mutableMapOf<String, Int>()
+            val children = attr.childNodes
+            for (j in 0 until children.length) {
+                val child = children.item(j)
+                if (child.nodeType != org.w3c.dom.Node.ELEMENT_NODE) continue
+                val childEl = child as org.w3c.dom.Element
+                if (childEl.tagName != "enum" && childEl.tagName != "flag") continue
+                val eName = childEl.getAttribute("name")
+                val eVal = childEl.getAttribute("value")
+                if (eName.isNotEmpty() && eVal.isNotEmpty()) {
+                    try { values[eName] = Integer.decode(eVal) } catch (_: Exception) {}
+                }
+            }
+            if (values.isNotEmpty()) {
+                enumValueMap[attrName] = values
+            }
+        }
+    }
+    System.err.println("Parsed ${enumValueMap.size} attrs with enum/flag values.")
+
+    println("Initializing layoutlib Bridge...")
+    val log = PreviewLog()
+    val bridge = Bridge()
+    val ok = bridge.init(
+        props, File(fontDir), nativeLibPath, icuData, hyphenData,
+        keyboardPaths, enumValueMap, log
+    )
+    if (!ok) {
+        System.err.println("Failed to initialize layoutlib Bridge")
+        System.exit(1)
+    }
+    println("Bridge initialized.")
+
+    // Load framework resources for rendering
+    println("Loading framework resources...")
+    val fwResources = FrameworkRenderResources(File(fwResDir, "res"))
+    println("  Loaded ${fwResources.size()} framework resource values.")
+
+    val hwConfig = HardwareConfig(
+        width, height, Density.create(density),
+        density.toFloat(), density.toFloat(),
+        ScreenSize.NORMAL, ScreenOrientation.PORTRAIT,
+        ScreenRound.NOTROUND, false
+    )
+
+    for (fqn in fqns) {
+        println("Rendering: $fqn")
+        try {
+            val image = render(bridge, fqn, hwConfig, fwResources, log)
+            if (image != null) {
+                val name = fqn.substringAfterLast('.')
+                val outFile = File(outputDir, "$name.png")
+                ImageIO.write(image, "PNG", outFile)
+                println("  -> ${outFile.name} (${image.width}x${image.height})")
+            } else {
+                System.err.println("  No image produced for $fqn")
+            }
+        } catch (e: Throwable) {
+            System.err.println("  Error: ${e.message}")
+            e.printStackTrace(System.err)
+        }
+    }
+
+    println("Done. Output: ${outputDir.absolutePath}")
+}
+
+private fun render(
+    bridge: Bridge, fqn: String, hw: HardwareConfig,
+    resources: FrameworkRenderResources, log: ILayoutLog
+): BufferedImage? {
+    val xml = """<?xml version="1.0" encoding="utf-8"?>
+<androidx.compose.ui.tooling.ComposeViewAdapter
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    tools:composableName="$fqn" />"""
+
+    val parser = LayoutXmlParser(xml)
+    val callback = MinimalCallback()
+
+    val params = SessionParams(
+        parser, SessionParams.RenderingMode.NORMAL, null, hw,
+        resources, callback, 21, 34, log
+    )
+    params.setAssetRepository(MinimalAssetRepository())
+    params.setForceNoDecor()
+    params.setImageFactory(IImageFactory { w, h ->
+        BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB)
+    })
+
+    val session = bridge.createSession(params)
+    if (!session.result.isSuccess) {
+        System.err.println("  Session failed: ${session.result.errorMessage}")
+        session.result.exception?.printStackTrace(System.err)
+        return null
+    }
+
+    session.render()
+
+    var image = session.image
+    // Crop to content bounds from root view info
+    if (image != null && session.rootViews?.isNotEmpty() == true) {
+        val root = session.rootViews[0]
+        val l = maxOf(0, root.left)
+        val t = maxOf(0, root.top)
+        val r = minOf(image.width, root.right)
+        val b = minOf(image.height, root.bottom)
+        if (r > l && b > t) {
+            image = image.getSubimage(l, t, r - l, b - t)
+        }
+    }
+
+    session.dispose()
+    return image
+}
+
+// ---------------------------------------------------------------------------
+// Framework resource loading
+// ---------------------------------------------------------------------------
+
+// Parses framework res/values XML files and resolves resource references.
+class FrameworkRenderResources(resDir: File) : RenderResources() {
+    private val ns = ResourceNamespace.ANDROID
+    // (type, name) -> ResourceValue
+    private val table = mutableMapOf<Pair<ResourceType, String>, ResourceValue>()
+    // styles: (name) -> StyleResourceValueImpl
+    private val styles = mutableMapOf<String, StyleResourceValueImpl>()
+
+    init {
+        val valuesDir = File(resDir, "values")
+        if (valuesDir.isDirectory) {
+            val dbf = DocumentBuilderFactory.newInstance()
+            valuesDir.listFiles { f -> f.extension == "xml" }?.forEach { xmlFile ->
+                try { parseValuesFile(dbf, xmlFile) } catch (_: Exception) {}
+            }
+        }
+    }
+
+    fun size() = table.size
+
+    private fun parseValuesFile(dbf: DocumentBuilderFactory, xmlFile: File) {
+        val doc = dbf.newDocumentBuilder().parse(xmlFile)
+        val root = doc.documentElement ?: return
+        val children = root.childNodes
+        for (i in 0 until children.length) {
+            val node = children.item(i)
+            if (node.nodeType != org.w3c.dom.Node.ELEMENT_NODE) continue
+            val el = node as org.w3c.dom.Element
+            val tagName = el.tagName
+            val name = el.getAttribute("name").takeIf { it.isNotEmpty() } ?: continue
+            val value = el.textContent?.trim() ?: ""
+
+            when (tagName) {
+                "dimen" -> put(ResourceType.DIMEN, name, value)
+                "integer" -> put(ResourceType.INTEGER, name, value)
+                "bool" -> put(ResourceType.BOOL, name, value)
+                "string" -> put(ResourceType.STRING, name, value)
+                "color" -> put(ResourceType.COLOR, name, value)
+                "fraction" -> put(ResourceType.FRACTION, name, value)
+                "item" -> {
+                    val typeName = el.getAttribute("type")
+                    val rt = try { ResourceType.fromXmlTagName(typeName) } catch (_: Exception) { null }
+                    if (rt != null) put(rt, name, value)
+                }
+                "style" -> {
+                    val parent = el.getAttribute("parent") ?: ""
+                    val ref = ResourceReference(ns, ResourceType.STYLE, name)
+                    val style = StyleResourceValueImpl(ref, parent, null)
+                    val items = el.getElementsByTagName("item")
+                    for (j in 0 until items.length) {
+                        val item = items.item(j) as org.w3c.dom.Element
+                        val attrName = item.getAttribute("name")
+                        if (attrName.isEmpty()) continue
+                        val attrValue = stripQuotes(item.textContent?.trim() ?: "")
+                        style.addItem(StyleItemResourceValueImpl(ns, attrName, attrValue, null))
+                    }
+                    styles[name] = style
+                    table[ResourceType.STYLE to name] = style
+                }
+            }
+        }
+    }
+
+    private fun stripQuotes(v: String): String {
+        if (v.length >= 2 && v.startsWith("\"") && v.endsWith("\""))
+            return v.substring(1, v.length - 1)
+        return v
+    }
+
+    private fun put(type: ResourceType, name: String, value: String) {
+        val ref = ResourceReference(ns, type, name)
+        table[type to name] = ResourceValueImpl(ref, stripQuotes(value))
+    }
+
+    override fun getUnresolvedResource(reference: ResourceReference): ResourceValue? {
+        return table[reference.resourceType to reference.name]
+    }
+
+    override fun findItemInTheme(attr: ResourceReference): ResourceValue? {
+        // Walk theme chain looking for the attribute
+        for (style in styles.values) {
+            val item = style.getItem(attr)
+            if (item != null) return item
+        }
+        return null
+    }
+
+    override fun findItemInStyle(
+        style: StyleResourceValue, attr: ResourceReference
+    ): ResourceValue? {
+        if (style is StyleResourceValueImpl) {
+            return style.getItem(attr)
+        }
+        return null
+    }
+
+    override fun resolveResValue(value: ResourceValue?): ResourceValue? {
+        if (value == null) return null
+        val v = value.value ?: return value
+        // Resolve @-references
+        if (v.startsWith("@")) {
+            val refStr = v.removePrefix("@").removePrefix("android:")
+            val slash = refStr.indexOf('/')
+            if (slash > 0) {
+                val typeName = refStr.substring(0, slash)
+                val resName = refStr.substring(slash + 1)
+                val rt = try { ResourceType.fromClassName(typeName) } catch (_: Exception) { null }
+                if (rt != null) {
+                    val resolved = table[rt to resName]
+                    if (resolved != null) return resolveResValue(resolved)
+                }
+            }
+        }
+        return value
+    }
+
+    override fun dereference(value: ResourceValue?): ResourceValue? = resolveResValue(value)
+
+    override fun getDefaultTheme(): StyleResourceValue? {
+        return styles["Theme.Material.Light.NoActionBar"]
+            ?: styles["Theme.Material.Light"]
+            ?: styles["Theme.Material"]
+            ?: styles.values.firstOrNull()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ILayoutLog
+// ---------------------------------------------------------------------------
+
+class PreviewLog : ILayoutLog {
+    override fun warning(tag: String?, msg: String?, cookie: Any?, data: Any?) {}
+    override fun error(tag: String?, msg: String?, cookie: Any?, data: Any?) {
+        System.err.println("ERROR: $msg")
+    }
+    override fun error(tag: String?, msg: String?, t: Throwable?, cookie: Any?, data: Any?) {
+        System.err.println("ERROR: $msg")
+    }
+    override fun fidelityWarning(
+        tag: String?, msg: String?, t: Throwable?, cookie: Any?, data: Any?
+    ) {}
+    override fun logAndroidFramework(priority: Int, tag: String?, message: String?) {}
+}
+
+// ---------------------------------------------------------------------------
+// ILayoutPullParser — delegates XmlPullParser methods to KXmlParser
+// ---------------------------------------------------------------------------
+
+class LayoutXmlParser private constructor(
+    private val inner: KXmlParser
+) : ILayoutPullParser, XmlPullParser by inner {
+    constructor(xml: String) : this(KXmlParser().also {
+        it.setInput(StringReader(xml))
+        it.setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, true)
+    })
+    override fun getViewCookie(): Any? = null
+    override fun getLayoutNamespace(): ResourceNamespace = ResourceNamespace.RES_AUTO
+}
+
+// ---------------------------------------------------------------------------
+// Minimal LayoutlibCallback for class loading
+// ---------------------------------------------------------------------------
+
+class MinimalAssetRepository : AssetRepository() {
+    override fun isSupported() = true
+    override fun openAsset(path: String, mode: Int): java.io.InputStream? = null
+    override fun openNonAsset(cookie: Int, path: String, mode: Int): java.io.InputStream? = null
+    override fun isFileResource(path: String) = false
+}
+
+class MinimalCallback : LayoutlibCallback() {
+    override fun loadView(
+        name: String, constructorSig: Array<out Class<*>>?,
+        constructorArgs: Array<out Any>?
+    ): Any {
+        val clazz = Class.forName(name)
+        return if (constructorSig != null && constructorArgs != null) {
+            clazz.getConstructor(*constructorSig).newInstance(*constructorArgs)
+        } else {
+            clazz.getDeclaredConstructor().newInstance()
+        }
+    }
+    override fun resolveResourceId(id: Int): ResourceReference? = null
+    override fun getOrGenerateResourceId(resource: ResourceReference) = 0
+    override fun getParser(layoutResource: ResourceValue): ILayoutPullParser? = null
+    override fun getAdapterBinding(
+        viewObject: Any, attributes: Map<String, String>?
+    ): AdapterBinding? = null
+    override fun getActionBarCallback() = ActionBarCallback()
+    override fun findClass(name: String): Class<*>? =
+        try { Class.forName(name) } catch (_: Exception) { null }
+    // XmlParserFactory methods
+    override fun createXmlParserForPsiFile(fileName: String): XmlPullParser? = null
+    override fun createXmlParserForFile(fileName: String): XmlPullParser? = null
+    override fun createXmlParser(): XmlPullParser = KXmlParser()
+}
+'''
+
+
+# ---------------------------------------------------------------------------
 # Builder — 7-step APK build pipeline
 # ---------------------------------------------------------------------------
 
@@ -1193,6 +1783,187 @@ class Builder:
         ]
         _run(cmd, "apksigner")
 
+    # -- Preview rendering ---------------------------------------------------
+
+    def preview(self, layoutlib_mgr):
+        """Compile sources and render @Preview composables to PNG."""
+        self.cfg.validate()
+        self._prepare_dirs()
+        self.layoutlib_mgr = layoutlib_mgr
+
+        # Discover @Preview functions in source
+        preview_fqns = self._find_preview_functions()
+        if not preview_fqns:
+            print("No @Preview composable functions found in source files.")
+            return
+
+        print(f"Found {len(preview_fqns)} preview(s): {', '.join(preview_fqns)}")
+
+        # Step 0: Resolve Maven deps (add ui-tooling-preview + ui-tooling)
+        deps = list(self.cfg.dependencies)
+        if not any("ui-tooling-preview" in d for d in deps):
+            deps.append("androidx.compose.ui:ui-tooling-preview:1.7.8")
+        if not any(d.startswith("androidx.compose.ui:ui-tooling:") for d in deps):
+            deps.append("androidx.compose.ui:ui-tooling:1.7.8")
+
+        self.resolver = MavenResolver(self.cfg)
+        self.resolver.resolve_all(deps)
+
+        # Steps 1-3: compile resources and sources
+        self._step1_compile_resources()
+        self._step2_link_resources()
+        self._step3_compile_sources()
+
+        # Step 3c: compile the preview renderer (if not cached)
+        self._compile_renderer()
+
+        # Step 4: run the renderer via host JVM
+        self._run_renderer(preview_fqns)
+
+    def _find_preview_functions(self):
+        """Scan Kotlin sources for @Preview annotated composable functions."""
+        previews = []
+        for src_dir in self.cfg.sources:
+            for root, _dirs, files in os.walk(src_dir):
+                for fname in files:
+                    if not fname.endswith(".kt"):
+                        continue
+                    fpath = os.path.join(root, fname)
+                    with open(fpath) as f:
+                        content = f.read()
+
+                    # Extract package name
+                    pkg = ""
+                    pkg_match = re.search(r'^package\s+([\w.]+)', content, re.MULTILINE)
+                    if pkg_match:
+                        pkg = pkg_match.group(1)
+
+                    # Derive Kotlin file class name (e.g. MainActivity.kt -> MainActivityKt)
+                    file_class = fname.removesuffix(".kt") + "Kt"
+
+                    # Match @Preview ... @Composable ... fun Name()
+                    # Handles both orderings and extra annotations between them
+                    for pattern in (
+                        r'@Preview(?:\([^)]*\))?\s+(?:@\w+(?:\([^)]*\))?\s+)*'
+                        r'@Composable\s+fun\s+(\w+)',
+                        r'@Composable\s+(?:@\w+(?:\([^)]*\))?\s+)*'
+                        r'@Preview(?:\([^)]*\))?\s+fun\s+(\w+)',
+                    ):
+                        for match in re.finditer(pattern, content):
+                            func_name = match.group(1)
+                            # Top-level composables compile to FileNameKt class
+                            fqn = f"{pkg}.{file_class}.{func_name}" if pkg else f"{file_class}.{func_name}"
+                            if fqn not in previews:
+                                previews.append(fqn)
+        return previews
+
+    def _compile_renderer(self):
+        """Compile PreviewRenderer.kt once (cached in .layoutlib/renderer/)."""
+        renderer_dir = os.path.join(self.cfg.layoutlib_dir, "renderer")
+        renderer_classes = os.path.join(renderer_dir, "classes")
+        marker = os.path.join(renderer_classes, ".compiled")
+        if os.path.isfile(marker):
+            return
+
+        print("\n[Preview] Compiling preview renderer...")
+        os.makedirs(renderer_classes, exist_ok=True)
+
+        # Write renderer source
+        renderer_src = os.path.join(renderer_dir, "PreviewRenderer.kt")
+        with open(renderer_src, "w") as f:
+            f.write(PREVIEW_RENDERER_KT)
+
+        # Compile against layoutlib JARs + kxml2 + kotlin-stdlib
+        sep = ";" if platform.system() == "Windows" else ":"
+        cp_parts = list(self.layoutlib_mgr.get_host_classpath())
+        if self.cfg.kotlin_stdlib:
+            cp_parts.append(self.cfg.kotlin_stdlib)
+
+        cmd = [
+            self.cfg.kotlinc_bin,
+            "-classpath", sep.join(cp_parts),
+            "-d", renderer_classes,
+            "-jvm-target", "1.8",
+            "-no-stdlib",
+            renderer_src,
+        ]
+        _run(cmd, "kotlinc (preview renderer)")
+
+        with open(marker, "w") as f:
+            f.write("ok")
+
+    def _run_renderer(self, preview_fqns):
+        """Execute the preview renderer via host JVM."""
+        print("\n[Preview] Running preview renderer...")
+
+        sep = ";" if platform.system() == "Windows" else ":"
+        renderer_classes = os.path.join(self.cfg.layoutlib_dir, "renderer", "classes")
+
+        # Build host classpath: renderer + layoutlib + user classes + deps + kotlin
+        cp_parts = [renderer_classes]
+        cp_parts += self.layoutlib_mgr.get_host_classpath()
+        cp_parts.append(self.classes_dir)
+        if self.resolver:
+            cp_parts += self.resolver.get_classpath_jars()
+
+        # Add android.jar for framework API stubs
+        if os.path.isfile(self.cfg.android_jar):
+            cp_parts.append(self.cfg.android_jar)
+
+        # Add kotlin-stdlib and kotlin-reflect from kotlinc/lib
+        if self.cfg.kotlin_home:
+            for jar_name in ("kotlin-stdlib.jar", "kotlin-reflect.jar"):
+                jar = os.path.join(self.cfg.kotlin_home, "lib", jar_name)
+                if os.path.isfile(jar) and jar not in cp_parts:
+                    cp_parts.append(jar)
+
+        native_lib_path = self.layoutlib_mgr.get_native_lib_path()
+        font_dir = self.layoutlib_mgr.get_font_dir()
+        icu_data = self.layoutlib_mgr.get_icu_data_path()
+        hyphen_data = self.layoutlib_mgr.get_hyphen_data_dir()
+        build_prop = self.layoutlib_mgr.get_build_prop() or ""
+        fw_res = self.layoutlib_mgr.get_framework_res_dir()
+        keyboard_paths = sep.join(self.layoutlib_mgr.get_keyboard_paths())
+        output_dir = self.cfg.preview_output_dir
+        os.makedirs(output_dir, exist_ok=True)
+
+        cmd = [
+            "java",
+            f"-Djava.library.path={native_lib_path}",
+            "--enable-native-access=ALL-UNNAMED",
+            "-cp", sep.join(cp_parts),
+            "preview.PreviewRendererKt",
+            self.classes_dir,
+            native_lib_path,
+            font_dir,
+            icu_data,
+            hyphen_data,
+            build_prop,
+            fw_res,
+            output_dir,
+            str(self.cfg.preview_width),
+            str(self.cfg.preview_height),
+            str(self.cfg.preview_density),
+            keyboard_paths,
+        ] + preview_fqns
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.stdout:
+            print(result.stdout)
+        if result.returncode != 0:
+            print(f"Preview renderer failed (exit code {result.returncode}):",
+                  file=sys.stderr)
+            if result.stderr:
+                print(result.stderr, file=sys.stderr)
+            sys.exit(1)
+
+        # List output files
+        pngs = glob.glob(os.path.join(output_dir, "*.png"))
+        if pngs:
+            print(f"\nGenerated {len(pngs)} preview image(s) in {output_dir}/")
+            for p in sorted(pngs):
+                print(f"  {os.path.basename(p)}")
+
 
 # ---------------------------------------------------------------------------
 # Utility
@@ -1264,6 +2035,35 @@ def cmd_build(args):
     builder.build()
 
 
+def cmd_preview(args):
+    """Render @Preview composables to PNG images using layoutlib."""
+    config = Config(args.config)
+
+    # Validate prerequisites
+    if not config.compose_enabled:
+        print("Preview requires Compose to be enabled (kotlin.compose: true in build.yaml).",
+              file=sys.stderr)
+        sys.exit(1)
+    if not os.path.isfile(config.android_jar):
+        print("Android SDK not found. Run './build.py setup' first.", file=sys.stderr)
+        sys.exit(1)
+    if not os.path.isfile(config.kotlinc_bin):
+        print("Kotlin compiler not found. Run './build.py setup' first.", file=sys.stderr)
+        sys.exit(1)
+    if not os.path.isfile(config.compose_plugin_jar):
+        print("Compose compiler plugin not found. Run './build.py setup' first.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # Download/setup layoutlib artifacts
+    layoutlib_mgr = LayoutlibManager(config)
+    layoutlib_mgr.setup()
+
+    # Run preview pipeline
+    builder = Builder(config)
+    builder.preview(layoutlib_mgr)
+
+
 def cmd_clean(args):
     """Remove the build output directory."""
     config = Config(args.config)
@@ -1287,6 +2087,7 @@ def main():
 
     sub.add_parser("setup", help="Download and install Android SDK")
     sub.add_parser("build", help="Build the APK")
+    sub.add_parser("preview", help="Render @Preview composables to PNG")
     sub.add_parser("clean", help="Remove build artifacts")
 
     args = parser.parse_args()
@@ -1298,6 +2099,7 @@ def main():
     commands = {
         "setup": cmd_setup,
         "build": cmd_build,
+        "preview": cmd_preview,
         "clean": cmd_clean,
     }
     commands[args.command](args)
