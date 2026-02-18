@@ -1,0 +1,26 @@
+app:
+  package: com.example.kotlintest
+  name: KotlinTestApp
+  version_code: 1
+  version_name: "1.0"
+sdk:
+  min_sdk: 21
+  target_sdk: 34
+  build_tools: "35.0.1"
+kotlin:
+  version: "2.1.20"
+  compose: false
+repositories:
+  - https://repo1.maven.org/maven2
+paths:
+  manifest: AndroidManifest.xml
+  sources:
+    - src
+  resources:
+    - res
+  libs: []
+dependencies:
+  - org.jetbrains.kotlin:kotlin-stdlib:1.8.22
+output:
+  dir: .build
+  apk_name: kotlin-test-debug.apk
