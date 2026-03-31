@@ -4,3 +4,6 @@
 *.keystore
 .deps/
 .layoutlib/
+__pycache__/
+*.pyc
+.pytest_cache/

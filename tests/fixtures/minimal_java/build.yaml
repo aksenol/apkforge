@@ -1,0 +1,20 @@
+app:
+  package: com.example.minimal
+  name: MinimalApp
+  version_code: 1
+  version_name: "1.0"
+sdk:
+  min_sdk: 21
+  target_sdk: 34
+  build_tools: "35.0.1"
+paths:
+  manifest: AndroidManifest.xml
+  sources:
+    - src
+  resources:
+    - res
+  libs: []
+dependencies: []
+output:
+  dir: .build
+  apk_name: minimal-debug.apk

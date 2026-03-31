@@ -26,126 +26,16 @@ import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
 
-# ---------------------------------------------------------------------------
-# Minimal YAML parser (fallback when PyYAML is not installed)
-# ---------------------------------------------------------------------------
-
-def mini_yaml_load(text):
-    """Parse a simple subset of YAML: nested mappings, scalars, and lists.
-
-    Supports:
-      - Nested mappings (indentation-based)
-      - Scalar values (strings, ints, bools)
-      - Sequence items (  - value)
-      - Quoted strings
-      - Empty lists written as []
-      - Comments (lines starting with #)
-
-    Does NOT support: anchors, multi-line strings, flow mappings, etc.
-    """
-    root = {}
-    stack = [(-1, root)]  # (indent_level, current_dict)
-
-    lines = text.splitlines()
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        i += 1
-
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-
-        indent = len(line) - len(line.lstrip())
-
-        # Pop stack to find parent at correct indent level
-        while len(stack) > 1 and stack[-1][0] >= indent:
-            stack.pop()
-
-        parent = stack[-1][1]
-
-        # List item
-        if stripped.startswith("- "):
-            value = _parse_scalar(stripped[2:].strip())
-            if isinstance(parent, list):
-                parent.append(value)
-            continue
-
-        # Key-value pair
-        if ":" in stripped:
-            colon_pos = stripped.index(":")
-            key = stripped[:colon_pos].strip()
-            rest = stripped[colon_pos + 1:].strip()
-
-            if rest == "" or rest == "":
-                # Nested mapping — will be filled by subsequent lines
-                child = {}
-                parent[key] = child
-                stack.append((indent, child))
-            elif rest == "[]":
-                parent[key] = []
-            else:
-                # Check if next lines are list items at deeper indent
-                peek = i
-                while peek < len(lines) and not lines[peek].strip():
-                    peek += 1
-                if peek < len(lines) and lines[peek].strip().startswith("- "):
-                    peek_indent = len(lines[peek]) - len(lines[peek].lstrip())
-                    if peek_indent > indent:
-                        lst = []
-                        parent[key] = lst
-                        stack.append((indent, lst))
-                        continue
-
-                parent[key] = _parse_scalar(rest)
-
-    return root
-
-
-def _parse_scalar(value):
-    """Convert a YAML scalar string to a Python type."""
-    if not value:
-        return ""
-
-    # Strip quotes
-    if (value.startswith('"') and value.endswith('"')) or \
-       (value.startswith("'") and value.endswith("'")):
-        return value[1:-1]
-
-    # Strip inline comments
-    for sep in ("  #", "\t#"):
-        if sep in value:
-            value = value[:value.index(sep)].rstrip()
-
-    low = value.lower()
-    if low == "true":
-        return True
-    if low == "false":
-        return False
-    if low == "null" or low == "~":
-        return None
-
-    try:
-        return int(value)
-    except ValueError:
-        pass
-    try:
-        return float(value)
-    except ValueError:
-        pass
-
-    return value
-
-
 def load_yaml(path):
-    """Load a YAML file, preferring PyYAML if available."""
-    with open(path, "r") as f:
-        text = f.read()
+    """Load a YAML file using PyYAML."""
     try:
         import yaml
-        return yaml.safe_load(text)
     except ImportError:
-        return mini_yaml_load(text)
+        print("Error: PyYAML is required. Install it with: pip install pyyaml",
+              file=sys.stderr)
+        sys.exit(1)
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
 
 
 # ---------------------------------------------------------------------------
